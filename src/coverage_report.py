@@ -14,12 +14,14 @@ import csv
 import os
 import re
 from pathlib import Path
+import sys
 
 
 HERE = Path(__file__).resolve().parents[1]
 VOCAB_PATH = HERE / "output" / "vocab.tsv"
 ANKI_PATH = HERE / "input" / "anki-mature.txt"
 OUT_DIR = HERE / "output"
+MANUAL_FILE = HERE / "input" / "spoken_grammar_known.tsv"
 
 
 def normalize(s: str) -> str:
@@ -63,6 +65,14 @@ def has_hiragana_or_kanji(s: str) -> bool:
         return False
     # Hiragana \u3040-\u309F, Kanji \u4E00-\u9FFF
     return bool(re.search(r"[\u3040-\u309F\u4E00-\u9FFF]", s))
+
+
+def is_hiragana_only(s: str) -> bool:
+    """Return True if string is composed only of Hiragana (including iteration marks)."""
+    if not s:
+        return False
+    # include hiragana block and iteration marks ゝ(309D) ゞ(309E)
+    return bool(re.fullmatch(r"^[\u3040-\u309F\u309D\u309E]+$", s))
 
 
 def load_vocab(path: Path):
@@ -137,6 +147,38 @@ def load_anki(path: Path):
     return items
 
 
+def load_manual(path: Path):
+    """Load manual classifications from `input/spoken_grammar_known.tsv`.
+
+    Returns a dict mapping lemma -> status string (lowercase), e.g. 'yes', 'no', 'ignore'.
+    """
+    manual = {}
+    if not path.exists():
+        return manual
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        reader = csv.reader(fh, delimiter="\t")
+        # skip header if present
+        first = next(reader, None)
+        # if first looks like header, continue, otherwise treat it as data
+        if first and len(first) >= 1 and first[0].strip().lower() == "lemma":
+            pass
+        else:
+            # first was actual data row
+            if first:
+                lemma = first[0].strip()
+                status = (first[1].strip().lower() if len(first) > 1 else "").strip()
+                if lemma:
+                    manual[lemma] = status
+        for parts in reader:
+            if not parts:
+                continue
+            lemma = parts[0].strip()
+            status = (parts[1].strip().lower() if len(parts) > 1 else "").strip()
+            if lemma:
+                manual[lemma] = status
+    return manual
+
+
 def find_match(lemma_norm: str, anki_items):
     # try exact normalized match first (consider all Anki variants)
     for a in anki_items:
@@ -156,18 +198,40 @@ def find_match(lemma_norm: str, anki_items):
 def main():
     anki_items = load_anki(ANKI_PATH)
     vocab_items = load_vocab(VOCAB_PATH)
+    manual_map = load_manual(MANUAL_FILE)
 
     matched_count = 0
     details = []
 
+    # Incorporate manual classifications:
+    # - if manual_map[lemma] == 'yes' -> treat as matched
+    # - if manual_map[lemma] == 'ignore' -> exclude from total and outputs
     for v in vocab_items:
-        m = find_match(v["norm"], anki_items)
+        norm = v["norm"]
+        raw = v["raw"]
+        example = v.get("example", "")
+
+        # check manual decisions first
+        m_status = manual_map.get(norm) or manual_map.get(raw)
+        if m_status == "ignore":
+            # mark as ignored: do not include in details (we'll track it but exclude later)
+            details.append({"raw": raw, "norm": norm, "matched": None, "match": "(ignored)", "example": example})
+            continue
+        if m_status == "yes":
+            # count as matched via manual file
+            matched_count += 1
+            details.append({"raw": raw, "norm": norm, "matched": True, "match": "(manual_known)", "example": example})
+            continue
+
+        # otherwise fall back to Anki matching
+        m = find_match(norm, anki_items)
         matched = bool(m)
         if matched:
             matched_count += 1
-        details.append({"raw": v["raw"], "norm": v["norm"], "matched": matched, "match": m or "", "example": v.get("example", "")})
+        details.append({"raw": raw, "norm": norm, "matched": matched, "match": m or "", "example": example})
 
-    total = len(vocab_items)
+    # Exclude ignored items from total
+    total = sum(1 for d in details if d.get("matched") is not None)
     percent = (matched_count / total * 100) if total else 0.0
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -185,11 +249,18 @@ def main():
         w = csv.writer(fh, delimiter="\t")
         w.writerow(["lemma_raw", "lemma_norm", "matched", "matched_anki_raw"])
         for d in details:
-            w.writerow([d["raw"], d["norm"], "yes" if d["matched"] else "no", d["match"]])
+            m = d.get("matched")
+            if m is True:
+                status = "yes"
+            elif m is False:
+                status = "no"
+            else:
+                status = "ignored"
+            w.writerow([d["raw"], d["norm"], status, d["match"]])
 
     missing_path = OUT_DIR / "coverage_missing.tsv"
-    # prepare missing entries, sort alphabetically by normalized lemma
-    missing_entries = [d for d in details if not d["matched"]]
+    # prepare missing entries: include only explicit False (i.e. not matched and not ignored)
+    missing_entries = [d for d in details if d.get("matched") is False]
     missing_entries.sort(key=lambda x: (x.get("norm") or x.get("raw") or ""))
 
     with missing_path.open("w", encoding="utf-8", newline="") as fh:
@@ -198,7 +269,22 @@ def main():
         for d in missing_entries:
             w.writerow([d["raw"], d["norm"], d.get("example", "")])
 
+    # At this point we have written the missing file.
     print(f"Wrote summary to {summary_path}\nDetails to {details_path}\nMissing to {missing_path}")
+
+    # Offer to run the manual classifier automatically when the environment variable is set.
+    if os.environ.get("RUN_MANUAL") == "1":
+        if sys.stdin.isatty():
+            try:
+                import manual_classify
+
+                manual_classify.main()
+            except Exception as exc:
+                print(f"Failed to run manual classifier: {exc}")
+        else:
+            print("RUN_MANUAL is set but no TTY available; skipped manual classification.")
+    else:
+        print("To run manual classification now: python3 src/manual_classify.py")
 
 
 if __name__ == "__main__":

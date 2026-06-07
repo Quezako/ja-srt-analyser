@@ -1,3 +1,3 @@
-total_vocab	3072
-matched	2907
-coverage_percent	94.63
+total_vocab	3048
+matched	2981
+coverage_percent	97.80

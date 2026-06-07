@@ -47,7 +47,21 @@ def simple_tokenize(text):
         r"(?P<kanji>[\u4E00-\u9FFF]+)|(?P<katakana>[\u30A0-\u30FFー・･]+)|(?P<hiragana>[\u3040-\u309F]+)|(?P<latin>[A-Za-z0-9]+)",
         re.UNICODE,
     )
-    tokens = [m.group(0) for m in pattern.finditer(text)]
+    # collect typed runs
+    runs = [(m.lastgroup, m.group(0)) for m in pattern.finditer(text)]
+
+    tokens = []
+    i = 0
+    while i < len(runs):
+        typ, seg = runs[i]
+        # merge Kanji + Hiragana (okurigana) sequences into one token, e.g. 互 + い -> 互い
+        if typ == 'kanji' and i + 1 < len(runs) and runs[i + 1][0] == 'hiragana':
+            merged = seg + runs[i + 1][1]
+            tokens.append(merged)
+            i += 2
+            continue
+        tokens.append(seg)
+        i += 1
     return tokens
 
 
