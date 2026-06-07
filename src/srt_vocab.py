@@ -38,9 +38,17 @@ def parse_srt(path):
 
 
 def simple_tokenize(text):
-    # Very small fallback tokenizer: extract runs of Japanese characters or Latin words
-    pattern = re.compile(r"[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]+|[A-Za-z0-9]+")
-    return pattern.findall(text)
+    # Improved fallback tokenizer: extract runs by script to avoid mixing
+    # - kanji block: \u4E00-\u9FFF
+    # - katakana block: \u30A0-\u30FF (include 'ー' prolonged sound mark and middle dot)
+    # - hiragana block: \u3040-\u309F
+    # - latin/number: A-Za-z0-9
+    pattern = re.compile(
+        r"(?P<kanji>[\u4E00-\u9FFF]+)|(?P<katakana>[\u30A0-\u30FFー・･]+)|(?P<hiragana>[\u3040-\u309F]+)|(?P<latin>[A-Za-z0-9]+)",
+        re.UNICODE,
+    )
+    tokens = [m.group(0) for m in pattern.finditer(text)]
+    return tokens
 
 
 def try_sudachi_tokenize(text, tokenizer, Mode):

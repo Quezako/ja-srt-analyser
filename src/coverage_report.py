@@ -40,6 +40,31 @@ def normalize(s: str) -> str:
     return s
 
 
+def is_katakana(s: str) -> bool:
+    """Return True if string is composed only of Katakana (and common punctuation like prolonged mark)."""
+    if not s:
+        return False
+    s = s.strip()
+    # Katakana Unicode block 30A0-30FF, include prolonged sound mark 'ー' and middle dot
+    return bool(re.fullmatch(r"^[\u30A0-\u30FFー・･]+$", s))
+
+
+def is_number(s: str) -> bool:
+    """Return True if string is only numeric (ASCII or fullwidth digits)."""
+    if not s:
+        return False
+    s = s.strip()
+    return bool(re.fullmatch(r"^[0-9０-９]+$", s))
+
+
+def has_hiragana_or_kanji(s: str) -> bool:
+    """Return True if string contains at least one Hiragana or Kanji character."""
+    if not s:
+        return False
+    # Hiragana \u3040-\u309F, Kanji \u4E00-\u9FFF
+    return bool(re.search(r"[\u3040-\u309F\u4E00-\u9FFF]", s))
+
+
 def load_vocab(path: Path):
     items = []
     if not path.exists():
@@ -53,7 +78,21 @@ def load_vocab(path: Path):
         first_col = fieldnames[0]
         for row in reader:
             raw = row.get(first_col, "").strip()
-            items.append({"raw": raw, "norm": normalize(raw)})
+            norm = normalize(raw)
+            # try to read example sentence from the known column name
+            example = ""
+            if "example_sentence" in row:
+                example = (row.get("example_sentence") or "").strip()
+            else:
+                # fallback: try common alternate header names
+                example = (row.get("example") or row.get("example_sentence ") or "").strip()
+            # ignore pure katakana tokens and pure numbers
+            if is_katakana(norm) or is_number(norm):
+                continue
+            # ignore tokens that do not contain hiragana or kanji (e.g. romaji, romaji+katakana+digits)
+            if not has_hiragana_or_kanji(norm):
+                continue
+            items.append({"raw": raw, "norm": norm, "example": example})
     return items
 
 
@@ -72,19 +111,45 @@ def load_anki(path: Path):
             first = parts[0].strip()
             if first == "":
                 continue
-            items.append({"raw": first, "norm": normalize(first)})
+            # build a list of normalized variants: the base form with bracketed readings removed
+            # plus any readings that appear inside [...] (e.g. "今日は[こんにちは]" -> variants "今日は", "こんにちは")
+            base_norm = normalize(first)
+            bracket_vals = re.findall(r"\[([^\]]+)\]", first)
+            norms = [base_norm]
+            for b in bracket_vals:
+                bnorm = normalize(b)
+                if bnorm and bnorm not in norms:
+                    norms.append(bnorm)
+
+            # decide whether to keep this Anki entry: keep if ANY variant is acceptable
+            any_katakana = all(is_katakana(n) for n in norms if n)
+            any_number = all(is_number(n) for n in norms if n)
+            any_has_hira_or_kanji = any(has_hiragana_or_kanji(n) for n in norms if n)
+
+            if any_katakana or any_number:
+                # skip entries that are exclusively katakana or exclusively numbers
+                continue
+            if not any_has_hira_or_kanji:
+                # skip entries that have no hiragana/kanji in any variant (e.g. romaji-only)
+                continue
+
+            items.append({"raw": first, "norms": norms})
     return items
 
 
 def find_match(lemma_norm: str, anki_items):
-    # try exact normalized match first
+    # try exact normalized match first (consider all Anki variants)
     for a in anki_items:
-        if lemma_norm and a["norm"] and lemma_norm == a["norm"]:
-            return a["raw"]
-    # try containment (either way)
+        norms = a.get("norms") or [a.get("norm")]
+        for an in norms:
+            if lemma_norm and an and lemma_norm == an:
+                return a["raw"]
+    # try containment (either way) across variants
     for a in anki_items:
-        if lemma_norm and a["norm"] and (lemma_norm in a["norm"] or a["norm"] in lemma_norm):
-            return a["raw"]
+        norms = a.get("norms") or [a.get("norm")]
+        for an in norms:
+            if lemma_norm and an and (lemma_norm in an or an in lemma_norm):
+                return a["raw"]
     return None
 
 
@@ -100,7 +165,7 @@ def main():
         matched = bool(m)
         if matched:
             matched_count += 1
-        details.append({"raw": v["raw"], "norm": v["norm"], "matched": matched, "match": m or ""})
+        details.append({"raw": v["raw"], "norm": v["norm"], "matched": matched, "match": m or "", "example": v.get("example", "")})
 
     total = len(vocab_items)
     percent = (matched_count / total * 100) if total else 0.0
@@ -123,12 +188,15 @@ def main():
             w.writerow([d["raw"], d["norm"], "yes" if d["matched"] else "no", d["match"]])
 
     missing_path = OUT_DIR / "coverage_missing.tsv"
+    # prepare missing entries, sort alphabetically by normalized lemma
+    missing_entries = [d for d in details if not d["matched"]]
+    missing_entries.sort(key=lambda x: (x.get("norm") or x.get("raw") or ""))
+
     with missing_path.open("w", encoding="utf-8", newline="") as fh:
         w = csv.writer(fh, delimiter="\t")
-        w.writerow(["lemma_raw", "lemma_norm"])
-        for d in details:
-            if not d["matched"]:
-                w.writerow([d["raw"], d["norm"]])
+        w.writerow(["lemma_raw", "lemma_norm", "example_sentence"])
+        for d in missing_entries:
+            w.writerow([d["raw"], d["norm"], d.get("example", "")])
 
     print(f"Wrote summary to {summary_path}\nDetails to {details_path}\nMissing to {missing_path}")
 
